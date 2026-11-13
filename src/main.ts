@@ -1,6 +1,7 @@
 import './style.css';
 import { loadCore, makePhantom, type Core } from './wasm';
 import { Renderer, type Result, type LineStyle } from './renderer';
+import { MusicControls, musicMarkup } from './music';
 
 const icons = {
   arrow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>',
@@ -49,7 +50,14 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="panel-footer"><span id="sinogram-dim">— detectors × — angles</span><span id="hover-readout">HOVER TO EXPLORE</span></div>
       </article>
 
-      <div class="projection-style" id="projection-style"><div class="projection-style-heading"><label id="lines-label" for="lines-toggle">Build image from coarse rays</label><button id="lines-toggle" class="switch" role="switch" aria-labelledby="lines-label" aria-checked="false" aria-controls="line-controls" disabled><span></span></button></div><div id="line-controls" hidden><div class="line-sliders"><div><div class="range-label"><label for="line-directions">Directions</label><output id="line-directions-value">64</output></div><input type="range" id="line-directions" min="2" max="180" step="1" value="64" /></div><div><div class="range-label"><label for="line-count">Rays across image</label><output id="line-count-value">48</output></div><input type="range" id="line-count" min="8" max="128" step="1" value="48" /></div><div><div class="range-label"><label for="line-width">Ray width</label><output id="line-width-value">35%</output></div><input type="range" id="line-width" min="0.1" max="1" step="0.05" value="0.35" /></div></div><p>Only coarse projection rays—no image underneath. Overlaps accumulate density. Saved PNG remains the standard reconstruction.</p></div></div>
+      <div class="projection-style" id="projection-style">
+        <div class="projection-style-heading"><label id="lines-label" for="lines-toggle">Build image from coarse rays</label><button id="lines-toggle" class="switch" role="switch" aria-labelledby="lines-label" aria-checked="false" aria-controls="line-controls" disabled><span></span></button></div>
+        <div id="line-controls" hidden>
+          <div class="line-sliders"><div><div class="range-label"><label for="line-directions">Directions</label><output id="line-directions-value">64</output></div><input type="range" id="line-directions" min="2" max="180" step="1" value="64" /></div><div><div class="range-label"><label for="line-count">Rays across image</label><output id="line-count-value">48</output></div><input type="range" id="line-count" min="8" max="128" step="1" value="48" /></div><div><div class="range-label"><label for="line-width">Ray width</label><output id="line-width-value">35%</output></div><input type="range" id="line-width" min="0.1" max="1" step="0.05" value="0.35" /></div></div>
+          <p>Only coarse projection rays—no image underneath. Overlaps accumulate density. Saved PNG remains the standard reconstruction.</p>
+          ${musicMarkup}
+        </div>
+      </div>
       </div>
 
       <aside class="panel settings-panel">
@@ -109,6 +117,7 @@ let ready = false;
 let uploaded: ImageBitmap | undefined;
 let uploadName = '';
 let hovered: { x: number; y: number } | undefined;
+const music = new MusicControls($('music-controls'), drawReconstruction);
 
 function inspectCoordinates() {
   if (!result || !hovered) return;
@@ -166,7 +175,21 @@ function redraw() {
 }
 
 function drawReconstruction() {
-  if (result && ready) renderer.draw(result.levels.length - 1, gain, color, 'reconstruction', lineStyle);
+  if (!result || !ready || busy) return;
+  const style = music.modulate(lineStyle, result.angles);
+  for (const [key, id, value] of [
+    ['directions', 'line-directions', String(style.directions)],
+    ['rays', 'line-count', String(style.rays)],
+    ['width', 'line-width', `${Math.round(style.width * 100)}%`],
+  ] as const) {
+    const slider = $<HTMLInputElement>(id);
+    // Do not move a handle under the user's pointer while setting a base value.
+    if (document.activeElement !== slider) slider.value = String(style[key]);
+    slider.title = `Resting value: ${key === 'width' ? `${Math.round(lineStyle[key] * 100)}%` : lineStyle[key]}`;
+    $(`${id}-value`).textContent = value;
+  }
+  $('image-readout').textContent = imageReadout(style);
+  renderer.draw(result.levels.length - 1, gain, color, 'reconstruction', style);
 }
 
 function drawSinogram() {
@@ -175,6 +198,7 @@ function drawSinogram() {
 
 function updateReconstruction() {
   if (!result) return;
+  music.setActive(lineStyle.enabled && ready && !busy);
   $('line-controls').hidden = !lineStyle.enabled;
   $('output-tag').textContent = lineStyle.enabled ? 'RAY DENSITY' : 'FILTERED BACKPROJECTION';
   $('output-dim').textContent = `${result.size} × ${result.size} px · from root projections`;
@@ -202,8 +226,8 @@ function selectLevel(index: number) {
   redraw();
 }
 
-function imageReadout() {
-  return lineStyle.enabled ? `${Math.min(lineStyle.directions, result?.angles ?? lineStyle.directions)} DIRECTIONS · RAYS ONLY` : qualityLabel;
+function imageReadout(style = lineStyle) {
+  return style.enabled ? `${Math.min(style.directions, result?.angles ?? style.directions)} DIRECTIONS · RAYS ONLY` : qualityLabel;
 }
 
 function buildPyramid() {
@@ -237,6 +261,7 @@ function preparePixels(size: number): Uint8ClampedArray {
 async function run() {
   if (!ready || busy) return;
   busy = true;
+  music.setActive(false);
   $('error').hidden = true;
   $('loading').hidden = false;
   $('sinogram-loading').hidden = false;
@@ -287,6 +312,8 @@ async function run() {
     $<HTMLButtonElement>('export').disabled = !result || !ready;
     $<HTMLButtonElement>('save-image').disabled = !result || !ready;
     controls.forEach(control => control.disabled = false);
+    music.setActive(lineStyle.enabled && ready);
+    drawReconstruction();
   }
 }
 
@@ -311,21 +338,19 @@ $('lines-toggle').addEventListener('click', () => {
 $('line-directions').addEventListener('input', () => {
   if (!ready) return;
   lineStyle.directions = Number($<HTMLInputElement>('line-directions').value);
-  $('line-directions-value').textContent = String(lineStyle.directions);
-  updateReconstruction();
+  drawReconstruction();
 });
 $('line-count').addEventListener('input', () => {
   if (!ready) return;
   lineStyle.rays = Number($<HTMLInputElement>('line-count').value);
-  $('line-count-value').textContent = String(lineStyle.rays);
   drawReconstruction();
 });
 $('line-width').addEventListener('input', () => {
   if (!ready) return;
   lineStyle.width = Number($<HTMLInputElement>('line-width').value);
-  $('line-width-value').textContent = `${Math.round(lineStyle.width * 100)}%`;
   drawReconstruction();
 });
+['line-directions', 'line-count', 'line-width'].forEach(id => $(id).addEventListener('blur', drawReconstruction));
 document.addEventListener('keydown', event => {
   const target = event.target as HTMLElement;
   if (event.key === 'Enter' && target === document.body) void run();
@@ -430,7 +455,7 @@ async function initialize() {
     sourceImage.width = 256; sourceImage.height = 256;
     sourceImageContext.putImageData(new ImageData(preview as Uint8ClampedArray<ArrayBuffer>, 256, 256), 0, 0); drawSource();
     renderer = new Renderer(outputCanvas, message => {
-      ready = false; showError(message); $<HTMLButtonElement>('run').disabled = true; $<HTMLButtonElement>('export').disabled = true; $<HTMLButtonElement>('save-image').disabled = true; $('engine-status').textContent = 'GPU disconnected'; $('engine-dot').classList.add('failed');
+      ready = false; music.setActive(false); showError(message); $<HTMLButtonElement>('run').disabled = true; $<HTMLButtonElement>('export').disabled = true; $<HTMLButtonElement>('save-image').disabled = true; $('engine-status').textContent = 'GPU disconnected'; $('engine-dot').classList.add('failed');
     });
     await renderer.initialize();
     renderer.attachCanvas(sinogramCanvas);

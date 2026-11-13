@@ -16,7 +16,7 @@ Open **http://localhost:5173**. The dev command compiles the AssemblyScript core
 ```sh
 npm run build       # WASM + TypeScript validation + production bundle
 npm run preview     # serve the production bundle
-npm test            # six WASM/geometry tests
+npm test            # WASM/geometry and audio-analysis tests
 
 npx playwright install chromium
 npm run test:browser # real GPU numerical checks and browser interaction tests
@@ -42,6 +42,7 @@ WebGPU requires a **secure context**: localhost or HTTPS. Plain HTTP on a LAN IP
 - Exposure and color controls are always available and affect only sinogram presentation. They never affect the reconstructed image, inverse, or raw data.
 - **Save image** downloads a grayscale PNG of the reconstructed pixels at source resolution, without overlays or min/max normalization.
 - Coarse-ray mode does not change saved standard PNGs, raw data, or the standard reconstruction. Its footer says **RAYS ONLY**, rather than presenting the standard image’s PSNR as a measurement of the coarse-ray result.
+- Inside coarse-ray controls, enable **Music reactive**, **Load music**, then press **Play**. Tracks stay local and play through Web Audio. Each coarse-ray parameter can follow **bass**, **mids**, **treble**, **overall energy**, or **beat pulses**, or stay **Manual**. Set a signed **Amount** to add/subtract a percentage of the slider’s range; results are clamped to its limits (including the available projection angles). The sliders show live values during playback; adjusting one sets its resting value. Pausing, ending the track, or disabling reactivity restores those values. Turning coarse rays off stops animation but lets the track keep playing.
 - **Export sinogram** saves any selected level as raw float32 integrals with a metadata header.
 
 Images are aspect-fit into a black square and converted to grayscale. Uploaded image values use weighted sRGB channel values, without inverse-gamma conversion. Source pixel intensities are normalized to [0, 1].
@@ -105,7 +106,11 @@ The viewer reports **PSNR** against the source using raw reconstructed float val
 
 A separate fragment shader box-averages groups of filtered detector bins into coarse projection samples. Each sample is backprojected as a finite-width straight band with a constant coefficient along its entire length. At every pixel, the shader sums all intersecting bands. The picture—including its shape and detail—comes from this accumulated ray density alone. The shader has **only a filtered-sinogram texture binding**: it cannot read or blend in the reconstructed image or the source. A GPU regression test destroys both the reconstructed-image and original sinogram textures before rendering this mode.
 
-Filtered projection coefficients are signed: positive bands add density, negative bands subtract it, as in filtered backprojection. Density is normalized by angular spacing and beam coverage, then mapped to grayscale with a fixed exposure. There is no colored weave, glow, image mask, or strength blend. This intentionally coarse inverse introduces banding, crosshatching, and streaks; it is not the standard full-resolution inverse. At 100% ray width the gaps close; narrow rays leave more visible intersections. The shader runs only on redraw, without an animation loop or rerunning forward/filter passes.
+Filtered projection coefficients are signed: positive bands add density, negative bands subtract it, as in filtered backprojection. Density is normalized by angular spacing and beam coverage, then mapped to grayscale with a fixed exposure. There is no colored weave, glow, image mask, or strength blend. This intentionally coarse inverse introduces banding, crosshatching, and streaks; it is not the standard full-resolution inverse. At 100% ray width the gaps close; narrow rays leave more visible intersections. The shader runs only on redraw, without rerunning forward/filter passes. Music mode requests redraws while a track is playing with reactivity and coarse rays enabled; it stops the animation loop when paused, disabled, hidden, recomputing, or disconnected from the GPU.
+
+### Music analysis
+
+Web Audio's 2048-sample FFT is split into bass (30–250 Hz), mids (250 Hz–4 kHz), and treble (4–16 kHz), averaged in linear power. Overall energy uses time-domain RMS. Band levels have a fast attack and slower release. Beat pulses detect bass onsets above a recent energy floor, with a short cooldown and exponential decay; this is not tempo estimation, source separation, or a beat grid. Playback, seeking, and track replacement reset the detector. Audio is streamed from a local object URL rather than decoding the whole track into memory.
 
 ## Implementation
 
@@ -117,8 +122,11 @@ Filtered projection coefficients are signed: positive bands add density, negativ
 | `src/shaders.ts` | WGSL leaf integration, shifted merge, Ram–Lak filter, backprojection, and display |
 | `src/renderer.ts` | WebGPU pipelines, atlas and reconstruction textures, render passes, float32 readback |
 | `src/main.ts` | Source/reconstruction viewer, image import, PSNR, stage inspection, PNG and sinogram export |
+| `src/audio.ts` | FFT band energy, RMS, bass-onset pulses, bounded parameter modulation |
+| `src/music.ts` | Local track playback, analysis loop, meters, per-parameter assignments |
 | `src/style.css` | Responsive lab interface |
 | `tests/core.test.mjs` | WASM geometry, input validation, rasterization, memory reuse |
+| `tests/audio.test.mjs` | Frequency bands, silence, attack/release, onset detection, signed modulation bounds |
 | `tests/browser/app.spec.ts` | Forward/inverse GPU correctness, interactions, PNG and raw export, import, mobile, missing-WebGPU path |
 
 Both GPU canvases share one device and one set of transform/reconstruction textures. `Renderer.attachCanvas()` attaches an additional view after initialization; `draw()` can target either canvas. Changing a view’s display controls does not rerun the transform or affect the other canvas. Resizing redraws the views at their individual sizes.
