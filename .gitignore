@@ -1,0 +1,6 @@
+node_modules/
+dist/
+public/core.wasm
+.DS_Store
+test-results/
+playwright-report/
