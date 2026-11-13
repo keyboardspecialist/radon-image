@@ -17,7 +17,7 @@ function musicTrack(seconds = 20) {
   return { name: 'test-beats.wav', mimeType: 'audio/wav', buffer: wav };
 }
 
-test('real audio drives assigned coarse-ray parameters without changing transforms or exports', async ({ page }) => {
+test('real audio drives coarse rays and PNG snapshots without changing transforms', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -81,18 +81,27 @@ test('real audio drives assigned coarse-ray parameters without changing transfor
   expect(directions).toBeGreaterThanOrEqual(2);
   expect(directions).toBeLessThanOrEqual(8);
   await expect(page.locator('#music-status')).toContainText('Reacting live');
+  // Recomputing resets analysis. Use steady RMS energy and wait for a live
+  // frame, rather than potentially saving the first (still-resting) frame.
+  await page.locator('#music-source-width').selectOption('energy');
+  await page.locator('#music-amount-width').fill('100');
+  await expect.poll(() => page.locator('#line-width').inputValue().then(Number)).toBeGreaterThan(0.35);
 
   const png = async () => {
     const pending = page.waitForEvent('download');
     await page.locator('#save-image').click();
-    const stream = await (await pending).createReadStream();
+    const download = await pending;
+    expect(download.suggestedFilename()).toBe('radon-256-coarse-rays.png');
+    const stream = await download.createReadStream();
     const chunks: Buffer[] = [];
     for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
     return Buffer.concat(chunks);
   };
   const playingPng = await png();
   await page.locator('#music-play').click();
-  expect(await png()).toEqual(playingPng);
+  const restingPng = await png();
+  expect(restingPng.equals(playingPng)).toBe(false);
+  expect(await png()).toEqual(restingPng);
   await expect(page.locator('#line-count')).toHaveValue('32');
   await expect(page.locator('#error')).toBeHidden();
   expect(errors).toEqual([]);

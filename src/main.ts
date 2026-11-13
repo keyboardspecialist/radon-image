@@ -38,7 +38,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="comparison" aria-label="Reconstruction and sinogram comparison">
       <article class="panel output-panel">
         <div class="panel-header"><h2><span class="panel-number">02</span> <span id="output-title">Reconstructed image</span></h2><span class="tag" id="output-tag">FILTERED BACKPROJECTION</span></div>
-        <div class="output-toolbar"><span class="header-note">FROM ROOT PROJECTIONS</span><button id="save-image" class="text-button" title="Save the original, unstylized reconstruction at source resolution" disabled>${icons.download} Save image</button></div>
+        <div class="output-toolbar"><span class="header-note">FROM ROOT PROJECTIONS</span><button id="save-image" class="text-button" title="Save the current reconstruction at source resolution" disabled>${icons.download} Save image</button></div>
         <div class="reconstruction-frame"><div class="reconstruction-stage"><canvas id="reconstruction" aria-label="Image reconstructed from the root Radon transform"></canvas><div id="loading" class="loading"><span class="spinner"></span><span id="loading-text">Preparing the renderer</span></div></div></div>
         <div class="panel-footer"><span id="output-dim">Reconstructing from projections…</span><span id="image-readout">SOURCE INTENSITY SCALE</span></div>
       </article>
@@ -54,7 +54,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="projection-style-heading"><label id="lines-label" for="lines-toggle">Build image from coarse rays</label><button id="lines-toggle" class="switch" role="switch" aria-labelledby="lines-label" aria-checked="false" aria-controls="line-controls" disabled><span></span></button></div>
         <div id="line-controls" hidden>
           <div class="line-sliders"><div><div class="range-label"><label for="line-directions">Directions</label><output id="line-directions-value">64</output></div><input type="range" id="line-directions" min="2" max="180" step="1" value="64" /></div><div><div class="range-label"><label for="line-count">Rays across image</label><output id="line-count-value">48</output></div><input type="range" id="line-count" min="8" max="128" step="1" value="48" /></div><div><div class="range-label"><label for="line-width">Ray width</label><output id="line-width-value">35%</output></div><input type="range" id="line-width" min="0.1" max="1" step="0.05" value="0.35" /></div></div>
-          <p>Only coarse projection rays—no image underneath. Overlaps accumulate density. Saved PNG remains the standard reconstruction.</p>
+          <p>Only coarse projection rays—no image underneath. Overlaps accumulate density. Save image exports this coarse-ray version while active.</p>
           ${musicMarkup}
         </div>
       </div>
@@ -106,6 +106,8 @@ let renderer: Renderer;
 let result: Result | undefined;
 let selectedLevel = 0;
 const lineStyle: LineStyle = { enabled: false, directions: 64, rays: 48, width: 0.35 };
+let displayedLineStyle: LineStyle = { ...lineStyle };
+let savingImage = false;
 let reconstructionPixels: Float32Array | undefined;
 let qualityLabel = 'SOURCE INTENSITY SCALE';
 let resolution = 256;
@@ -190,6 +192,7 @@ function drawReconstruction() {
   }
   $('image-readout').textContent = imageReadout(style);
   renderer.draw(result.levels.length - 1, gain, color, 'reconstruction', style);
+  displayedLineStyle = { ...style };
 }
 
 function drawSinogram() {
@@ -203,7 +206,8 @@ function updateReconstruction() {
   $('output-tag').textContent = lineStyle.enabled ? 'RAY DENSITY' : 'FILTERED BACKPROJECTION';
   $('output-dim').textContent = `${result.size} × ${result.size} px · from root projections`;
   $('image-readout').textContent = imageReadout();
-  $('image-readout').title = lineStyle.enabled ? 'Coarse filtered projection rays alone accumulate image density. No reconstructed-image texture is bound. The standard reconstruction and exports are unchanged.' : 'PSNR compares raw float32 reconstruction with the source, using peak intensity 1. No fitted scaling or normalization.';
+  $('image-readout').title = lineStyle.enabled ? 'Coarse filtered projection rays alone accumulate image density. No reconstructed-image texture is bound. Save image exports this view; the standard reconstruction and raw sinogram data are unchanged.' : 'PSNR compares raw float32 reconstruction with the source, using peak intensity 1. No fitted scaling or normalization.';
+  $('save-image').title = lineStyle.enabled ? 'Save the current coarse-ray image at source resolution, including live music modulation' : 'Save the standard reconstruction at source resolution';
   outputCanvas.setAttribute('aria-label', lineStyle.enabled ? 'Image formed entirely from overlapping coarse projection rays' : 'Image reconstructed from the root Radon transform');
   drawReconstruction();
 }
@@ -310,7 +314,7 @@ async function run() {
     $('sinogram-loading').hidden = true;
     $<HTMLButtonElement>('run').disabled = !ready;
     $<HTMLButtonElement>('export').disabled = !result || !ready;
-    $<HTMLButtonElement>('save-image').disabled = !result || !ready;
+    $<HTMLButtonElement>('save-image').disabled = !result || !ready || savingImage;
     controls.forEach(control => control.disabled = false);
     music.setActive(lineStyle.enabled && ready);
     drawReconstruction();
@@ -392,22 +396,36 @@ function download(blob: Blob, name: string) {
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
-$('save-image').addEventListener('click', () => {
-  if (!result || !reconstructionPixels || busy) return;
+$('save-image').addEventListener('click', async () => {
+  if (!result || !reconstructionPixels || busy || !ready || savingImage) return;
   const size = result.size;
-  const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size;
-  const context = canvas.getContext('2d')!;
-  const image = context.createImageData(size, size);
-  for (let i = 0; i < reconstructionPixels.length; i++) {
-    const value = Math.round(Math.max(0, Math.min(1, reconstructionPixels[i])) * 255);
-    image.data[i * 4] = image.data[i * 4 + 1] = image.data[i * 4 + 2] = value;
-    image.data[i * 4 + 3] = 255;
+  const style = { ...displayedLineStyle };
+  savingImage = true;
+  $<HTMLButtonElement>('save-image').disabled = true;
+  try {
+    const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size;
+    const context = canvas.getContext('2d')!;
+    let image: ImageData;
+    if (style.enabled) {
+      image = new ImageData(await renderer.readCoarseReconstruction(style), size, size);
+    } else {
+      image = context.createImageData(size, size);
+      for (let i = 0; i < reconstructionPixels.length; i++) {
+        const value = Math.round(Math.max(0, Math.min(1, reconstructionPixels[i])) * 255);
+        image.data[i * 4] = image.data[i * 4 + 1] = image.data[i * 4 + 2] = value;
+        image.data[i * 4 + 3] = 255;
+      }
+    }
+    context.putImageData(image, 0, 0);
+    const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('Could not encode the image as PNG.');
+    download(blob, `radon-${size}-${style.enabled ? 'coarse-rays' : 'reconstructed'}.png`);
+  } catch (error) {
+    showError(`Image export failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    savingImage = false;
+    $<HTMLButtonElement>('save-image').disabled = busy || !ready || !result;
   }
-  context.putImageData(image, 0, 0);
-  canvas.toBlob(blob => {
-    if (blob) download(blob, `radon-${size}-reconstructed.png`);
-    else showError('Could not encode the reconstructed image as PNG.');
-  }, 'image/png');
 });
 
 $('export').addEventListener('click', async () => {

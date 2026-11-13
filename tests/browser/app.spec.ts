@@ -256,7 +256,7 @@ test('fragment hierarchy preserves mass, matches a direct projection, and is lin
   expect(measurements.gpuErrors).toEqual([]);
 });
 
-test('coarse-ray reconstruction is reversible, adjustable, and does not change the saved standard image', async ({ page }) => {
+test('Save image exports coarse rays when active and restores the standard export when disabled', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -265,13 +265,18 @@ test('coarse-ray reconstruction is reversible, adjustable, and does not change t
   await expect(page.locator('#error')).toBeHidden();
   const time = await page.locator('#metric-time').textContent();
   const quality = await page.locator('#image-readout').textContent();
-  const saveImage = async () => {
+  const saveImage = async (mode = 'reconstructed') => {
     const downloadPromise = page.waitForEvent('download');
     await page.locator('#save-image').click();
-    const stream = await (await downloadPromise).createReadStream();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe(`radon-256-${mode}.png`);
+    const stream = await download.createReadStream();
     const chunks: Buffer[] = [];
     for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
-    return Buffer.concat(chunks);
+    const png = Buffer.concat(chunks);
+    expect(png.readUInt32BE(16)).toBe(256);
+    expect(png.readUInt32BE(20)).toBe(256);
+    return png;
   };
   const originalPng = await saveImage();
   const sinogramBefore = await page.locator('#sinogram').screenshot();
@@ -281,6 +286,9 @@ test('coarse-ray reconstruction is reversible, adjustable, and does not change t
   await expect(page.locator('#lines-toggle')).toHaveAttribute('aria-checked', 'true');
   await expect(page.locator('#line-controls')).toBeVisible();
   await expect(page.locator('#output-tag')).toHaveText('RAY DENSITY');
+  await expect(page.locator('#save-image')).toHaveAttribute('title', /coarse-ray/);
+  const coarsePng = await saveImage('coarse-rays');
+  expect(coarsePng.equals(originalPng)).toBe(false);
   const styled = await page.locator('#reconstruction').screenshot();
   expect((await page.locator('#sinogram').screenshot()).equals(sinogramBefore)).toBe(true);
   const visiblePixels = await page.evaluate(async (base64: string) => {
@@ -303,7 +311,9 @@ test('coarse-ray reconstruction is reversible, adjustable, and does not change t
   await expect(page.locator('#line-width-value')).toHaveText('50%');
   const coarser = await page.locator('#reconstruction').screenshot();
   expect(coarser.equals(styled)).toBe(false);
-  expect(await saveImage()).toEqual(originalPng);
+  const adjustedPng = await saveImage('coarse-rays');
+  expect(adjustedPng.equals(coarsePng)).toBe(false);
+  expect(await saveImage('coarse-rays')).toEqual(adjustedPng);
   await page.locator('.level').first().click();
   await expect(page.locator('#sinogram-title')).toHaveText('Local sinograms');
   await expect(page.locator('#projection-style')).toBeVisible();
@@ -311,6 +321,7 @@ test('coarse-ray reconstruction is reversible, adjustable, and does not change t
   await page.locator('#lines-toggle').click();
   await expect(page.locator('#output-tag')).toHaveText('FILTERED BACKPROJECTION');
   await expect(page.locator('#image-readout')).toHaveText(quality!);
+  expect(await saveImage()).toEqual(originalPng);
   await expect(page.locator('#metric-time')).toHaveText(time!);
   await expect(page.locator('#error')).toBeHidden();
   expect(errors).toEqual([]);
@@ -339,12 +350,29 @@ test('coarse rays render without any source, reconstructed-image, or unfiltered 
     result.levels.forEach((level: { texture: GPUTexture }) => level.texture.destroy());
     const device: GPUDevice = renderer.device; // Test-only validation inspection.
     device.pushErrorScope('validation');
-    renderer.draw(result.levels.length - 1, 4, true, 'reconstruction', { enabled: true, directions: 64, rays: 32, width: 0.35 });
+    const style = { enabled: true, directions: 64, rays: 32, width: 0.35 };
+    const pendingExport = renderer.readCoarseReconstruction(style);
+    // Preview updates must not overwrite the snapshot's dedicated uniforms.
+    renderer.draw(result.levels.length - 1, 4, true, 'reconstruction', { ...style, directions: 2, width: 1 });
+    const pixels = await pendingExport;
+    const repeated = await renderer.readCoarseReconstruction(style);
+    renderer.draw(result.levels.length - 1, 4, true, 'reconstruction', style);
     await device.queue.onSubmittedWorkDone();
     const error = await device.popErrorScope();
-    return { validation: error?.message ?? null, errors };
+    let peak = 0;
+    for (let i = 0; i < pixels.length; i += 4) peak = Math.max(peak, pixels[i]);
+    return {
+      validation: error?.message ?? null, errors, exportLength: pixels.length, exportPeak: peak,
+      stableSnapshot: pixels.every((value: number, i: number) => value === repeated[i]),
+      grayscaleOpaque: pixels.every((value: number, i: number) => i % 4 === 3 ? value === 255 : value === pixels[i - i % 4]),
+    };
   });
-  expect(validation).toEqual({ validation: null, errors: [] });
+  expect(validation.validation).toBeNull();
+  expect(validation.errors).toEqual([]);
+  expect(validation.exportLength).toBe(128 * 128 * 4);
+  expect(validation.exportPeak).toBeGreaterThan(180);
+  expect(validation.stableSnapshot).toBe(true);
+  expect(validation.grayscaleOpaque).toBe(true);
   const rays = await page.locator('#rays-only-test').screenshot();
   const energy = await page.evaluate(async (base64: string) => {
     const bitmap = await createImageBitmap(new Blob([Uint8Array.from(atob(base64), c => c.charCodeAt(0))], { type: 'image/png' }));

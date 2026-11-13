@@ -42,6 +42,7 @@ export class Renderer {
   private backprojectPipeline!: GPURenderPipeline;
   private reconstructionViewPipeline!: GPURenderPipeline;
   private linesPipeline!: GPURenderPipeline;
+  private linesExportPipeline!: GPURenderPipeline;
   private linesUniform!: GPUBuffer;
   private viewUniform!: GPUBuffer;
   private result?: Result;
@@ -80,7 +81,7 @@ export class Renderer {
         primitive: { topology: 'triangle-list' },
       });
     };
-    [this.leafPipeline, this.mergePipeline, this.viewPipeline, this.filterPipeline, this.backprojectPipeline, this.reconstructionViewPipeline, this.linesPipeline] = await Promise.all([
+    [this.leafPipeline, this.mergePipeline, this.viewPipeline, this.filterPipeline, this.backprojectPipeline, this.reconstructionViewPipeline, this.linesPipeline, this.linesExportPipeline] = await Promise.all([
       create('Leaf ray integrals', leafShader, 'project', 'r32float'),
       create('2×2 shifted projection merge', mergeShader, 'merge', 'r32float'),
       create('Sinogram presentation', displayShader, 'display', format),
@@ -88,6 +89,7 @@ export class Renderer {
       create('Filtered backprojection', backprojectShader, 'backproject', 'r32float'),
       create('Reconstructed image presentation', reconstructionDisplayShader, 'display', format),
       create('Coarse-ray density backprojection', projectionLinesShader, 'display', format),
+      create('Coarse-ray PNG export', projectionLinesShader, 'display', 'rgba8unorm'),
     ]);
     this.viewUniform = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.linesUniform = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -222,12 +224,7 @@ export class Renderer {
     const pipeline = styled ? this.linesPipeline : view === 'reconstruction' ? this.reconstructionViewPipeline : this.viewPipeline;
     const texture = styled ? this.result.filtered : view === 'reconstruction' ? this.result.reconstruction : level.texture;
     if (styled) {
-      const root = this.result.levels[this.result.levels.length - 1];
-      this.device.queue.writeBuffer(this.linesUniform, 0, new Float32Array([
-        width, height, this.result.size, root.bins, this.result.angles,
-        Math.max(1, Math.min(this.result.angles, Math.round(lines.directions))),
-        Math.max(8, Math.min(128, Math.round(lines.rays))), Math.max(0.1, Math.min(1, lines.width)),
-      ]));
+      this.device.queue.writeBuffer(this.linesUniform, 0, this.lineParameters(this.result, lines, width, height));
     }
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -257,6 +254,49 @@ export class Renderer {
   async readReconstruction(): Promise<Float32Array> {
     if (!this.result) throw new Error('Run a transform first.');
     return this.readTexture(this.result.reconstruction, this.result.size, this.result.size);
+  }
+
+  private lineParameters(result: Result, lines: LineStyle, width: number, height: number): Float32Array<ArrayBuffer> {
+    const root = result.levels[result.levels.length - 1];
+    return new Float32Array([
+      width, height, result.size, root.bins, result.angles,
+      Math.max(1, Math.min(result.angles, Math.round(lines.directions))),
+      Math.max(8, Math.min(128, Math.round(lines.rays))), Math.max(0.1, Math.min(1, lines.width)),
+    ]);
+  }
+
+  // Render the same ray-density shader at source resolution, not a screenshot
+  // of the CSS-sized preview. Dedicated resources freeze this frame while music
+  // continues to redraw with different uniforms on the visible canvas.
+  async readCoarseReconstruction(lines: LineStyle): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    if (!this.result) throw new Error('Run a transform first.');
+    const result = this.result, size = result.size;
+    const bytesPerRow = Math.ceil(size * 4 / 256) * 256;
+    const texture = this.device.createTexture({
+      label: 'Coarse-ray export snapshot', size: [size, size], format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const uniform = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const buffer = this.device.createBuffer({ size: bytesPerRow * size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      this.device.queue.writeBuffer(uniform, 0, this.lineParameters(result, lines, size, size));
+      const bindGroup = this.device.createBindGroup({ layout: this.linesExportPipeline.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: uniform } }, { binding: 1, resource: result.filtered.createView() },
+      ] });
+      const encoder = this.device.createCommandEncoder({ label: 'Export coarse-ray PNG pixels' });
+      const pass = encoder.beginRenderPass({ colorAttachments: [{
+        view: texture.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store',
+      }] });
+      pass.setPipeline(this.linesExportPipeline); pass.setBindGroup(0, bindGroup); pass.draw(3); pass.end();
+      encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow }, [size, size]);
+      this.device.queue.submit([encoder.finish()]);
+      await buffer.mapAsync(GPUMapMode.READ);
+      const padded = new Uint8Array(buffer.getMappedRange());
+      const pixels = new Uint8ClampedArray(size * size * 4);
+      for (let y = 0; y < size; y++) pixels.set(padded.subarray(y * bytesPerRow, y * bytesPerRow + size * 4), y * size * 4);
+      buffer.unmap();
+      return pixels;
+    } finally { buffer.destroy(); uniform.destroy(); texture.destroy(); }
   }
 
   private async readTexture(texture: GPUTexture, width: number, height: number): Promise<Float32Array> {
